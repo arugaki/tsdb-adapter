@@ -12,9 +12,9 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"os"
 	"path/filepath"
-	"tsdb-adpter/adapter"
+	"tsdb-adapter/adapter"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"tsdb-adpter/config"
+	"tsdb-adapter/config"
 )
 
 

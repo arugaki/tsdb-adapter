@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/tsdb/labels"
 	"github.com/go-kit/kit/log"
 	"time"
-	"tsdb-adpter/config"
+	"tsdb-adapter/config"
 )
 
 type Adapter struct {
