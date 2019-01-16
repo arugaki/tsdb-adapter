@@ -37,7 +37,7 @@ func main() {
 	a.Flag("web.listen-address",
 		"Address to listen on for API.").
 		Default("0.0.0.0:9005").StringVar(&cfg.ListenAddr)
-	fmt.Println(cfg.ListenAddr)
+
 	a.Flag("tsdb.retention", "How long to retain samples in storage.").
 		Default("15d").SetValue(&cfg.Retention)
 
@@ -129,7 +129,6 @@ func RemoteWrtie(w http.ResponseWriter, r *http.Request) {
 }
 
 func RemoteRead(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.Method)
 	compressed, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -149,12 +148,11 @@ func RemoteRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawData := ad.RemoteReader(req)
-
-	data, _ := proto.Marshal(rawData)
+	res, _ := proto.Marshal(rawData)
 	// sender
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Encoding", "snappy")
-	compressed = snappy.Encode(nil, data)
+	compressed = snappy.Encode(nil, res)
 	if _, err := w.Write(compressed); err != nil {
 		return
 	}

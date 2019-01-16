@@ -181,9 +181,13 @@
   revision = "b1a0a9a36d7453ba0f62578b99712f3a6c5f82d1"
 
 [[projects]]
-  digest = "1:06a611a2a3b64f8857ecf49e5d0b6a8352ce6a8e742e4231f7bc04be5485664a"
+  digest = "1:2462d0e42bd6bd0c4357cda2fe1e3b2b18e232e2ef63e0d4da474b92cdc55a20"
   name = "github.com/prometheus/prometheus"
-  packages = ["prompb"]
+  packages = [
+    "pkg/labels",
+    "prompb",
+    "storage",
+  ]
   pruneopts = "UT"
   revision = "b639fe140c1f71b2cbad3fc322b17efe60839e7e"
   version = "v2.6.1"
@@ -322,10 +326,17 @@
   analyzer-name = "dep"
   analyzer-version = 1
   input-imports = [
+    "github.com/go-kit/kit/log",
+    "github.com/go-kit/kit/log/level",
     "github.com/gogo/protobuf/proto",
     "github.com/golang/snappy",
+    "github.com/pkg/errors",
+    "github.com/prometheus/client_golang/prometheus",
+    "github.com/prometheus/common/model",
     "github.com/prometheus/prometheus/prompb",
+    "github.com/prometheus/prometheus/storage",
     "github.com/prometheus/tsdb",
+    "github.com/prometheus/tsdb/labels",
     "gopkg.in/alecthomas/kingpin.v2",
   ]
   solver-name = "gps-cdcl"

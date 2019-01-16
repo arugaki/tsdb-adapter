@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"errors"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/tsdb"
 	"github.com/prometheus/tsdb/labels"
-	"github.com/go-kit/kit/log"
 	"time"
 	"tsdb-adapter/config"
 )
@@ -13,7 +16,10 @@ import (
 type Adapter struct {
 	db     *tsdb.DB
 	logger log.Logger
+	cache  map[uint64]uint64
 }
+
+var errSampleLimit = errors.New("sample limit exceeded")
 
 func NewAdapter(l log.Logger, c *config.Config) (*Adapter, error) {
 	if c.MinBlockDuration > c.MaxBlockDuration {
@@ -38,79 +44,183 @@ func NewAdapter(l log.Logger, c *config.Config) (*Adapter, error) {
 	})
 
 	if err != nil {
-		l.Log("error is ", err)
+		level.Error(l).Log("msg", "open tsdb failed", "err", err)
 		return nil, err
 	}
 
-	return &Adapter{db, l}, nil
+	return &Adapter{db, l, make(map[uint64]uint64)}, nil
 }
 
 func (a *Adapter) RemoteReader(querys prompb.ReadRequest) *prompb.ReadResponse {
 	//query
-	query := querys.Queries[0]
-	startTime := query.StartTimestampMs
-	endTime := query.EndTimestampMs
-	matchers := query.Matchers
-	a.logger.Log("Query:", startTime, endTime, matchers)
-
-	ms := convertLabelMatcher(matchers)
-
+	var startTime, endTime int64
+	var matchers []*prompb.LabelMatcher
 	var queryResult prompb.QueryResult
-	queryResult.Timeseries = a.getTimeSeries(startTime, endTime, ms)
 	var queryResults []*prompb.QueryResult
-	queryResults = append(queryResults, &queryResult)
 	var resp prompb.ReadResponse
-	resp.Results = queryResults
+	var err error
 
+	for _, query := range querys.Queries {
+		startTime = query.StartTimestampMs
+		endTime = query.EndTimestampMs
+		matchers = query.Matchers
+		ms := a.convertLabelMatcher(matchers)
+
+		queryResult.Timeseries, err = a.getTimeSeries(startTime, endTime, ms)
+		if err != nil {
+			level.Debug(a.logger).Log("call", "getTimeSeries", "err", err)
+			return nil
+		}
+		queryResults = append(queryResults, &queryResult)
+	}
+
+	resp.Results = queryResults
 	return &resp
 }
 
 func (a *Adapter) RemoteWriter(querys prompb.WriteRequest)  {
 
+	var hash uint64
+	var lbls labels.Labels
+
+	app := a.db.Appender()
+
+	flag := true
+
+	for _, ts := range querys.Timeseries {
+		for _, sample := range ts.Samples {
+			lbls = convertLabel(ts.Labels)
+			hash = lbls.Hash()
+			if ref, ok :=a.cache[hash]; ok {
+				switch err := app.AddFast(ref, sample.Timestamp, sample.Value); err {
+				case nil:
+					continue
+				case storage.ErrNotFound:
+					level.Debug(a.logger).Log("msg", "Error not found", "err", err)
+					flag = false
+				case storage.ErrOutOfOrderSample:
+					level.Debug(a.logger).Log("msg", "Out of order sample", "series", err)
+					flag = false
+					continue
+				case storage.ErrDuplicateSampleForTimestamp:
+					level.Debug(a.logger).Log("msg", "Duplicate sample for timestamp", "series", err)
+					flag = false
+					continue
+				case storage.ErrOutOfBounds:
+					level.Debug(a.logger).Log("msg", "Out of bounds metric", "series", err)
+					flag = false
+					continue
+				case errSampleLimit:
+					level.Debug(a.logger).Log("msg", "Sample Error", "series", err)
+					flag = false
+					continue
+				}
+
+				if !flag {
+					delete(a.cache, hash)
+					ref, err := app.Add(lbls, sample.Timestamp, sample.Value)
+					if err != nil {
+						level.Debug(a.logger).Log("call", "appender.Add", "err", err)
+					}
+
+					a.cache[hash] = ref
+				}
+
+			} else {
+				ref, err := app.Add(lbls, sample.Timestamp, sample.Value)
+				switch err {
+				case nil:
+					continue
+				case storage.ErrNotFound:
+					level.Debug(a.logger).Log("call", "appender.Add", "err", err)
+					flag = false
+				case storage.ErrOutOfOrderSample:
+					level.Debug(a.logger).Log("msg", "Out of order sample", "series", err)
+					flag = false
+					continue
+				case storage.ErrDuplicateSampleForTimestamp:
+					level.Debug(a.logger).Log("msg", "Duplicate sample for timestamp", "series", err)
+					flag = false
+					continue
+				case storage.ErrOutOfBounds:
+					level.Debug(a.logger).Log("msg", "Out of bounds metric", "series", err)
+					flag = false
+					continue
+				case errSampleLimit:
+					level.Debug(a.logger).Log("msg", "Sample Error", "series", err)
+					flag = false
+					continue
+				}
+
+				a.cache[hash] = ref
+			}
+		}
+	}
+
+	err := app.Commit()
+	if err != nil {
+		level.Debug(a.logger).Log("call", "appender.Commit", "err", err)
+		err = app.Rollback()
+		if err != nil {
+			level.Debug(a.logger).Log("call", "appender.Rollback", "err", err)
+		}
+	}
 }
 
-
-func (a *Adapter) getTimeSeries(mint, maxt int64, labels []labels.Matcher) []*prompb.TimeSeries {
+func (a *Adapter) getTimeSeries(mint, maxt int64, lbls []labels.Matcher) ([]*prompb.TimeSeries, error) {
 
 	tss := make([]*prompb.TimeSeries, 0)
-	var v float64
-	var t int64
-	var ts *prompb.TimeSeries
+	var ts = &prompb.TimeSeries{}
 
 	q, err := a.db.Querier(mint, maxt)
 	if err != nil {
-		a.logger.Log("error is ", err)
-		return nil
+		level.Error(a.logger).Log("msg", "Get Querier failed", "err", err)
+		return nil, err
 	}
 
-	series, err := q.Select(labels...)
+	series, err := q.Select(lbls...)
 	if err != nil {
-		a.logger.Log("error is ", err)
-		return nil
+		level.Error(a.logger).Log("msg", "Select Series failed", "err", err)
+		return nil, err
 	}
-
-	for ss := series.At(); ss != nil;{
-		ts = nil
+	for {
+		flag := series.Next()
+		if flag == false {
+			break
+		}
+		ss := series.At()
 		lbs := ss.Labels()
 		for _, lb := range lbs {
 			ts.Labels = append(ts.Labels, &prompb.Label{lb.Name, lb.Value})
 		}
 
 		si := ss.Iterator()
-		for t, v = si.At();;{
-			ts.Samples = append(ts.Samples, prompb.Sample{v, t})
-
-			if si.Next() == false {
+		for {
+			flag := si.Next()
+			if flag == false {
 				break
 			}
-		}
-	}
+			t, v := si.At()
+			ts.Samples = append(ts.Samples, prompb.Sample{v, t})
 
-	return tss
+		}
+		tss = append(tss, ts)
+	}
+	return tss, nil
 }
 
-func convertLabelMatcher(matchers []*prompb.LabelMatcher) []labels.Matcher {
-	lbs := make([]labels.Matcher, len(matchers))
+func convertLabel(lbls []*prompb.Label) labels.Labels{
+
+	res := make([]labels.Label,0, len(lbls))
+	for _, lb := range lbls {
+		res = append(res, labels.Label{lb.Name, lb.Value})
+	}
+
+	return res
+}
+
+func (a *Adapter) convertLabelMatcher(matchers []*prompb.LabelMatcher) []labels.Matcher {
+	lbs := make([]labels.Matcher, 0, len(matchers))
 	var mat labels.Matcher
 	for _, m := range matchers {
 		switch m.Type {
@@ -120,6 +230,7 @@ func convertLabelMatcher(matchers []*prompb.LabelMatcher) []labels.Matcher {
 		case prompb.LabelMatcher_RE:
 			mat, err := labels.NewRegexpMatcher(m.Name, m.Value)
 			if err != nil {
+				level.Error(a.logger).Log("msg", "RegexpMatcher Error", "err", err)
 			}
 			lbs = append(lbs, mat)
 		case prompb.LabelMatcher_NEQ:
@@ -128,7 +239,7 @@ func convertLabelMatcher(matchers []*prompb.LabelMatcher) []labels.Matcher {
 		case prompb.LabelMatcher_NRE:
 			m, err := labels.NewRegexpMatcher(m.Name, m.Value)
 			if err != nil {
-
+				level.Error(a.logger).Log("msg", "NotRegexpMatcher Error", "err", err)
 			}
 			mat :=  &notRegexpMatcher{m}
 			lbs = append(lbs, mat)
@@ -138,3 +249,4 @@ func convertLabelMatcher(matchers []*prompb.LabelMatcher) []labels.Matcher {
 
 	return lbs
 }
+
